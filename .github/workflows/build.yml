@@ -1,0 +1,121 @@
+name: Build FM Synth
+
+on:
+  push:
+    branches: [ main, master ]
+    tags:
+      - 'v*'
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:  # Permite ejecutar manualmente
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Setup MSYS2
+      uses: msys2/setup-msys2@v2
+      with:
+        msystem: MINGW64
+        update: true
+        install: >-
+          mingw-w64-x86_64-gcc
+          mingw-w64-x86_64-cmake
+          mingw-w64-x86_64-ninja
+          mingw-w64-x86_64-raylib
+          mingw-w64-x86_64-rtaudio
+
+    - name: Build
+      shell: msys2 {0}
+      run: |
+        mkdir build
+        cd build
+        cmake .. -G Ninja -DCMAKE_BUILD_TYPE=Release
+        ninja
+
+    - name: Prepare Release
+      shell: msys2 {0}
+      run: |
+        mkdir -p release
+        cp build/fm_synth.exe release/ || true
+        cp build/fm_synth_gui.exe release/ || true
+        # Copiar DLLs necesarias
+        cp /mingw64/bin/libgcc_s_seh-1.dll release/ || true
+        cp /mingw64/bin/libstdc++-6.dll release/ || true
+        cp /mingw64/bin/libwinpthread-1.dll release/ || true
+        cp /mingw64/bin/librtaudio.dll release/ || true
+        # raylib suele ser estático, pero por si acaso
+        cp /mingw64/bin/libraylib.dll release/ 2>/dev/null || true
+
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: fm-synth-windows
+        path: release/
+
+  build-macos:
+    runs-on: macos-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Dependencies
+      run: |
+        brew install rtaudio raylib cmake
+
+    - name: Build
+      run: |
+        mkdir build
+        cd build
+        cmake .. -DCMAKE_BUILD_TYPE=Release
+        make -j$(sysctl -n hw.ncpu)
+
+    - name: Prepare Release
+      run: |
+        mkdir -p release
+        cp build/fm_synth release/ || true
+        cp build/fm_synth_gui release/ || true
+
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: fm-synth-macos
+        path: release/
+
+  # Crear release cuando se pushea un tag
+  release:
+    needs: [build-windows, build-macos]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    steps:
+    - name: Download Windows Artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: fm-synth-windows
+        path: windows
+
+    - name: Download macOS Artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: fm-synth-macos
+        path: macos
+
+    - name: Create ZIP files
+      run: |
+        cd windows && zip -r ../fm-synth-windows.zip . && cd ..
+        cd macos && zip -r ../fm-synth-macos.zip . && cd ..
+
+    - name: Create Release
+      uses: softprops/action-gh-release@v1
+      with:
+        files: |
+          fm-synth-windows.zip
+          fm-synth-macos.zip
+        draft: false
+        prerelease: false
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
