@@ -1,1 +1,0 @@
-/usr/bin/c++  -arch arm64 -Wl,-search_paths_first -Wl,-headerpad_max_install_names CMakeFiles/fm_synth_gui.dir/fm_synth_gui.cpp.o -o fm_synth_gui  /opt/homebrew/opt/rtaudio/lib/librtaudio.dylib /opt/homebrew/opt/raylib/lib/libraylib.dylib -framework CoreAudio -framework CoreFoundation -framework IOKit -framework Cocoa -framework OpenGL
