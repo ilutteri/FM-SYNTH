@@ -1,0 +1,4 @@
+/Users/ignacio/Documents/AMB/FM/build/CMakeFiles/fm_synth.dir
+/Users/ignacio/Documents/AMB/FM/build/CMakeFiles/fm_synth_gui.dir
+/Users/ignacio/Documents/AMB/FM/build/CMakeFiles/edit_cache.dir
+/Users/ignacio/Documents/AMB/FM/build/CMakeFiles/rebuild_cache.dir

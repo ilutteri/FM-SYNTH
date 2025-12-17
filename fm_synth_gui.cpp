@@ -985,15 +985,24 @@ int main() {
     InitWindow(screenWidth, screenHeight, "FM Synth - 3 Operators / 6 Voices");
     SetTargetFPS(60);
 
-    // Mapeo de teclas simplificado: A-; (una fila del teclado)
-    // A S D F G H J K L ; = C D E F G A B C D E (escala mayor simplificada)
-    const int keyMapping[] = {
+    // Mapeo de teclas estilo piano:
+    // Fila inferior (blancas): A S D F G H J K L ; = C D E F G A B C D E
+    // Fila superior (negras):  W E   T Y U   O P   = C# D#  F# G# A#  C# D#
+    const int whiteKeyMapping[] = {
         KEY_A, KEY_S, KEY_D, KEY_F, KEY_G, KEY_H, KEY_J, KEY_K, KEY_L, KEY_SEMICOLON
     };
-    const int keyNotes[] = {
-        0, 2, 4, 5, 7, 9, 11, 12, 14, 16  // C D E F G A B C D E (escala mayor)
+    const int whiteKeyNotes[] = {
+        0, 2, 4, 5, 7, 9, 11, 12, 14, 16  // C D E F G A B C D E
     };
-    const int numKeys = 10;
+    const int numWhiteKeys = 10;
+
+    const int blackKeyMapping[] = {
+        KEY_W, KEY_E, KEY_T, KEY_Y, KEY_U, KEY_O, KEY_P
+    };
+    const int blackKeyNotes[] = {
+        1, 3, 6, 8, 10, 13, 15  // C# D# F# G# A# C# D#
+    };
+    const int numBlackKeys = 7;
 
     while (!WindowShouldClose()) {
         // Actualizar parámetros de todas las voces
@@ -1021,11 +1030,17 @@ int main() {
             filterR->setHighPass(guiFilterCutoff, guiFilterQ);
         }
 
-        // Recolectar todas las teclas presionadas
+        // Recolectar todas las teclas presionadas (blancas y negras)
         std::vector<int> currentKeys;
-        for (int i = 0; i < numKeys; i++) {
-            if (IsKeyDown(keyMapping[i])) {
-                int note = 12 * currentOctave + keyNotes[i];
+        for (int i = 0; i < numWhiteKeys; i++) {
+            if (IsKeyDown(whiteKeyMapping[i])) {
+                int note = 12 * currentOctave + whiteKeyNotes[i];
+                currentKeys.push_back(note);
+            }
+        }
+        for (int i = 0; i < numBlackKeys; i++) {
+            if (IsKeyDown(blackKeyMapping[i])) {
+                int note = 12 * currentOctave + blackKeyNotes[i];
                 currentKeys.push_back(note);
             }
         }
@@ -1257,9 +1272,8 @@ int main() {
         // Signal chain
         DrawText("Signal: Synth -> Filter -> Chorus -> Reverb -> Out", 450, 467, 11, Color{100, 100, 120, 255});
 
-        // Controles
-        DrawText("KEYBOARD: A S D F G H J K L ;  |  OCTAVE: Z/X  |  EXIT: ESC", 25, 555, 13, WHITE);
-        DrawText("Click piano keys or use keyboard to play. Click RANDOMIZE to explore new sounds!", 25, 575, 11, GRAY);
+        // Controles (sutil)
+        DrawText("Play with keyboard or mouse  |  Z/X: octave  |  ESC: exit", 25, 575, 11, Color{80, 80, 100, 255});
 
         EndDrawing();
     }

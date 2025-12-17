@@ -42,13 +42,34 @@ jobs:
         mkdir -p release
         cp build/fm_synth.exe release/ || true
         cp build/fm_synth_gui.exe release/ || true
-        # Copiar DLLs necesarias
+
+        # Copiar TODAS las DLLs necesarias de MinGW
+        # Runtime de C++
         cp /mingw64/bin/libgcc_s_seh-1.dll release/ || true
         cp /mingw64/bin/libstdc++-6.dll release/ || true
         cp /mingw64/bin/libwinpthread-1.dll release/ || true
-        cp /mingw64/bin/librtaudio.dll release/ || true
-        # raylib suele ser estático, pero por si acaso
-        cp /mingw64/bin/libraylib.dll release/ 2>/dev/null || true
+
+        # RtAudio y sus dependencias
+        cp /mingw64/bin/librtaudio*.dll release/ || true
+        cp /mingw64/bin/libportaudio*.dll release/ || true
+
+        # Otras dependencias que pueden necesitarse
+        cp /mingw64/bin/libssp-0.dll release/ || true
+
+        # Listar qué DLLs se copiaron para debug
+        echo "=== DLLs copiadas ==="
+        ls -la release/*.dll || true
+
+        # Usar ldd para ver dependencias y copiar las que falten
+        echo "=== Dependencias de fm_synth_gui.exe ==="
+        ldd build/fm_synth_gui.exe | grep mingw64 | awk '{print $3}' | while read dll; do
+          if [ -f "$dll" ]; then
+            cp "$dll" release/ 2>/dev/null || true
+          fi
+        done
+
+        echo "=== DLLs finales ==="
+        ls -la release/
 
     - name: Upload Artifact
       uses: actions/upload-artifact@v4
