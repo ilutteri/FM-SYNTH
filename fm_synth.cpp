@@ -2,6 +2,7 @@
 #include <cmath>
 #include <vector>
 #include <memory>
+#include <atomic>
 #include <rtaudio/RtAudio.h>
 
 // =====================
