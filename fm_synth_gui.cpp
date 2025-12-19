@@ -9,619 +9,21 @@
 #include <rtaudio/RtAudio.h>
 #include "raylib.h"
 
-// Constantes
-const double TWO_PI = 6.28318530717958647692;
-const double SAMPLE_RATE = 44100.0;
-const int WAVEFORM_SIZE = 512;
-
-// ============================================================================
-// Clase Oscillator
-// ============================================================================
-
-class Oscillator {
-private:
-    double phase;
-    double phaseIncrement;
-    double frequency;
-    double sampleRate;
-
-public:
-    Oscillator(double freq, double sr)
-        : phase(0.0), frequency(freq), sampleRate(sr) {
-        updatePhaseIncrement();
-    }
-
-    void setFrequency(double freq) {
-        frequency = freq;
-        updatePhaseIncrement();
-    }
-
-    double getFrequency() const { return frequency; }
-
-    double process(double modulation = 0.0) {
-        double output = std::sin(phase + modulation);
-        phase += phaseIncrement;
-        if (phase >= TWO_PI) {
-            phase -= TWO_PI;
-        }
-        return output;
-    }
-
-    void reset() {
-        phase = 0.0;
-    }
-
-private:
-    void updatePhaseIncrement() {
-        phaseIncrement = TWO_PI * frequency / sampleRate;
-    }
-};
-
-// ============================================================================
-// ADSR Envelope
-// ============================================================================
-
-enum EnvelopeState {
-    ENV_IDLE,
-    ENV_ATTACK,
-    ENV_DECAY,
-    ENV_SUSTAIN,
-    ENV_RELEASE
-};
-
-class ADSREnvelope {
-private:
-    double attackTime;
-    double decayTime;
-    double sustainLevel;
-    double releaseTime;
-
-    EnvelopeState state;
-    double currentLevel;
-    double sampleRate;
-
-    double attackIncrement;
-    double decayIncrement;
-    double releaseIncrement;
-    double releaseStartLevel;
-
-public:
-    ADSREnvelope(double sr)
-        : attackTime(0.01),
-          decayTime(0.1),
-          sustainLevel(0.7),
-          releaseTime(0.3),
-          state(ENV_IDLE),
-          currentLevel(0.0),
-          sampleRate(sr),
-          releaseStartLevel(0.0) {
-        updateIncrements();
-    }
-
-    void noteOn() {
-        state = ENV_ATTACK;
-    }
-
-    void noteOff() {
-        if (state != ENV_IDLE) {
-            releaseStartLevel = currentLevel;
-            releaseIncrement = releaseTime > 0.0 ? releaseStartLevel / (releaseTime * sampleRate) : releaseStartLevel;
-            state = ENV_RELEASE;
-        }
-    }
-
-    double process() {
-        switch (state) {
-            case ENV_IDLE:
-                currentLevel = 0.0;
-                break;
-
-            case ENV_ATTACK:
-                currentLevel += attackIncrement;
-                if (currentLevel >= 1.0) {
-                    currentLevel = 1.0;
-                    state = ENV_DECAY;
-                }
-                break;
-
-            case ENV_DECAY:
-                currentLevel -= decayIncrement;
-                if (currentLevel <= sustainLevel) {
-                    currentLevel = sustainLevel;
-                    state = ENV_SUSTAIN;
-                }
-                break;
-
-            case ENV_SUSTAIN:
-                currentLevel = sustainLevel;
-                break;
-
-            case ENV_RELEASE:
-                currentLevel -= releaseIncrement;
-                if (currentLevel <= 0.0) {
-                    currentLevel = 0.0;
-                    state = ENV_IDLE;
-                }
-                break;
-        }
-
-        return currentLevel;
-    }
-
-    bool isActive() const {
-        return state != ENV_IDLE;
-    }
-
-    EnvelopeState getState() const { return state; }
-    double getLevel() const { return currentLevel; }
-
-    void setAttack(double seconds) {
-        attackTime = std::max(0.001, seconds);
-        updateIncrements();
-    }
-
-    void setDecay(double seconds) {
-        decayTime = std::max(0.001, seconds);
-        updateIncrements();
-    }
-
-    void setSustain(double level) {
-        sustainLevel = std::max(0.0, std::min(1.0, level));
-        updateIncrements();
-    }
-
-    void setRelease(double seconds) {
-        releaseTime = std::max(0.001, seconds);
-        updateIncrements();
-    }
-
-    double getAttack() const { return attackTime; }
-    double getDecay() const { return decayTime; }
-    double getSustain() const { return sustainLevel; }
-    double getRelease() const { return releaseTime; }
-
-private:
-    void updateIncrements() {
-        attackIncrement = 1.0 / (attackTime * sampleRate);
-        decayIncrement = (1.0 - sustainLevel) / (decayTime * sampleRate);
-    }
-};
-
-// ============================================================================
-// Algoritmos FM de 4 operadores
-// ============================================================================
-
-enum FMAlgorithm {
-    ALG_STACK = 0,      // 4 -> 3 -> 2 -> 1 (serie completa)
-    ALG_TWIN,           // (4->3) + (2) -> 1
-    ALG_BRANCH,         // 4 -> 3 -> 1, 4 -> 2 -> 1
-    ALG_PARALLEL,       // (2 + 3 + 4) -> 1
-    ALG_DUAL_CARRIER,   // 4 -> 3, 2 -> 1 (dos carriers)
-    ALG_TRIPLE,         // 4 -> (1, 2, 3) todos carriers
-    ALG_COUNT
-};
-
-const char* algorithmNames[] = {
-    "Stack",
-    "Twin",
-    "Branch",
-    "Parallel",
-    "Dual",
-    "Triple"
-};
-
-// ============================================================================
-// FMSynth con 4 operadores + ADSR
-// ============================================================================
-
-class FMSynth {
-private:
-    Oscillator op1, op2, op3, op4;
-    ADSREnvelope envelope;
-
-    std::atomic<double> ratio1, ratio2, ratio3, ratio4;
-    std::atomic<double> index1, index2, index3, index4;
-
-    double prevSample1;
-
-    std::atomic<int> algorithm;
-    double amplitude;
-    std::atomic<bool> noteActive;
-    std::atomic<double> currentFrequency;
-    double sampleRate;
-
-public:
-    FMSynth(double freq, double sr)
-        : op1(freq, sr),
-          op2(freq * 2.0, sr),
-          op3(freq * 3.0, sr),
-          op4(freq * 4.0, sr),
-          envelope(sr),
-          ratio1(1.0),
-          ratio2(2.0),
-          ratio3(3.0),
-          ratio4(4.0),
-          index1(0.0),
-          index2(2.0),
-          index3(1.5),
-          index4(1.0),
-          prevSample1(0.0),
-          algorithm(ALG_STACK),
-          amplitude(0.3),
-          noteActive(false),
-          currentFrequency(freq),
-          sampleRate(sr) {
-    }
-
-    double process() {
-        if (!envelope.isActive()) return 0.0;
-
-        double out1, out2, out3, out4;
-        double idx1 = index1.load();
-        double idx2 = index2.load();
-        double idx3 = index3.load();
-        double idx4 = index4.load();
-
-        double feedback = idx1 * prevSample1;
-        double envLevel = envelope.process();
-
-        switch (algorithm.load()) {
-            case ALG_STACK:
-                // 4 -> 3 -> 2 -> 1
-                out4 = op4.process();
-                out3 = op3.process(idx4 * out4);
-                out2 = op2.process(idx3 * out3);
-                out1 = op1.process(idx2 * out2 + feedback);
-                break;
-
-            case ALG_TWIN:
-                // (4->3) + 2 -> 1
-                out4 = op4.process();
-                out3 = op3.process(idx4 * out4);
-                out2 = op2.process();
-                out1 = op1.process(idx3 * out3 + idx2 * out2 + feedback);
-                break;
-
-            case ALG_BRANCH:
-                // 4 -> 3 -> 1, 4 -> 2 -> 1
-                out4 = op4.process();
-                out3 = op3.process(idx4 * out4);
-                out2 = op2.process(idx4 * out4);
-                out1 = op1.process(idx3 * out3 + idx2 * out2 + feedback);
-                break;
-
-            case ALG_PARALLEL:
-                // (2 + 3 + 4) -> 1
-                out2 = op2.process();
-                out3 = op3.process();
-                out4 = op4.process();
-                out1 = op1.process(idx2 * out2 + idx3 * out3 + idx4 * out4 + feedback);
-                break;
-
-            case ALG_DUAL_CARRIER:
-                // 4 -> 3 (carrier), 2 -> 1 (carrier)
-                out4 = op4.process();
-                out3 = op3.process(idx4 * out4);
-                out2 = op2.process();
-                out1 = op1.process(idx2 * out2 + feedback);
-                prevSample1 = out1;
-                return (out1 + out3 * 0.7) * amplitude * envLevel * 0.7;
-
-            case ALG_TRIPLE:
-                // 4 -> (1, 2, 3) todos carriers
-                out4 = op4.process();
-                out1 = op1.process(idx4 * out4 + feedback);
-                out2 = op2.process(idx4 * out4);
-                out3 = op3.process(idx4 * out4);
-                prevSample1 = out1;
-                return (out1 + out2 * 0.6 + out3 * 0.4) * amplitude * envLevel * 0.5;
-
-            default:
-                return 0.0;
-        }
-
-        prevSample1 = out1;
-        return out1 * amplitude * envLevel;
-    }
-
-    void noteOn(double freq) {
-        currentFrequency.store(freq);
-        op1.setFrequency(freq * ratio1.load());
-        op2.setFrequency(freq * ratio2.load());
-        op3.setFrequency(freq * ratio3.load());
-        op4.setFrequency(freq * ratio4.load());
-        op1.reset();
-        op2.reset();
-        op3.reset();
-        op4.reset();
-        prevSample1 = 0.0;
-        noteActive.store(true);
-        envelope.noteOn();
-    }
-
-    void noteOff() {
-        noteActive.store(false);
-        envelope.noteOff();
-    }
-
-    bool isActive() const { return envelope.isActive(); }
-
-    // Setters
-    void setRatio1(double r) { ratio1.store(r); if (noteActive.load()) op1.setFrequency(currentFrequency.load() * r); }
-    void setRatio2(double r) { ratio2.store(r); if (noteActive.load()) op2.setFrequency(currentFrequency.load() * r); }
-    void setRatio3(double r) { ratio3.store(r); if (noteActive.load()) op3.setFrequency(currentFrequency.load() * r); }
-    void setRatio4(double r) { ratio4.store(r); if (noteActive.load()) op4.setFrequency(currentFrequency.load() * r); }
-
-    void setIndex1(double i) { index1.store(i); }
-    void setIndex2(double i) { index2.store(i); }
-    void setIndex3(double i) { index3.store(i); }
-    void setIndex4(double i) { index4.store(i); }
-    void setAlgorithm(int alg) { algorithm.store(alg); }
-
-    void setAttack(double t) { envelope.setAttack(t); }
-    void setDecay(double t) { envelope.setDecay(t); }
-    void setSustain(double l) { envelope.setSustain(l); }
-    void setRelease(double t) { envelope.setRelease(t); }
-
-    // Getters
-    double getRatio1() const { return ratio1.load(); }
-    double getRatio2() const { return ratio2.load(); }
-    double getRatio3() const { return ratio3.load(); }
-    double getRatio4() const { return ratio4.load(); }
-    double getIndex1() const { return index1.load(); }
-    double getIndex2() const { return index2.load(); }
-    double getIndex3() const { return index3.load(); }
-    double getIndex4() const { return index4.load(); }
-    int getAlgorithm() const { return algorithm.load(); }
-    double getCurrentFrequency() const { return currentFrequency.load(); }
-
-    double getEnvelopeLevel() const { return envelope.getLevel(); }
-    EnvelopeState getEnvelopeState() const { return envelope.getState(); }
-};
-
-// ============================================================================
-// Buffer circular para waveform
-// ============================================================================
-
-class WaveformBuffer {
-private:
-    std::vector<float> buffer;
-    std::atomic<int> writeIndex;
-    int size;
-
-public:
-    WaveformBuffer(int bufferSize) : size(bufferSize), writeIndex(0) {
-        buffer.resize(size, 0.0f);
-    }
-
-    void write(float sample) {
-        buffer[writeIndex.load()] = sample;
-        writeIndex.store((writeIndex.load() + 1) % size);
-    }
-
-    float read(int index) const {
-        int readIdx = (writeIndex.load() + index) % size;
-        return buffer[readIdx];
-    }
-
-    int getSize() const { return size; }
-};
-
-// ============================================================================
-// Chorus - Estilo Juno 106
-// ============================================================================
-
-class JunoChorus {
-private:
-    static const int MAX_DELAY = 2048;
-    std::vector<double> delayLineL;
-    std::vector<double> delayLineR;
-    int writeIndex;
-    double lfoPhase1;
-    double lfoPhase2;
-    double sampleRate;
-
-    const double lfoRate1 = 0.513;
-    const double lfoRate2 = 0.863;
-    const double baseDelay = 0.005;
-    const double depth = 0.003;
-
-public:
-    JunoChorus(double sr) : sampleRate(sr), writeIndex(0), lfoPhase1(0), lfoPhase2(0) {
-        delayLineL.resize(MAX_DELAY, 0.0);
-        delayLineR.resize(MAX_DELAY, 0.0);
-    }
-
-    void process(double input, double& outL, double& outR, double mix) {
-        delayLineL[writeIndex] = input;
-        delayLineR[writeIndex] = input;
-
-        double lfo1 = std::sin(lfoPhase1 * 2.0 * 3.14159265);
-        double lfo2 = std::sin(lfoPhase2 * 2.0 * 3.14159265 + 1.5708);
-
-        double delayTimeL = baseDelay + depth * lfo1;
-        double delayTimeR = baseDelay + depth * lfo2;
-
-        double delaySamplesL = delayTimeL * sampleRate;
-        double delaySamplesR = delayTimeR * sampleRate;
-
-        double readPosL = writeIndex - delaySamplesL;
-        double readPosR = writeIndex - delaySamplesR;
-        if (readPosL < 0) readPosL += MAX_DELAY;
-        if (readPosR < 0) readPosR += MAX_DELAY;
-
-        int indexL = (int)readPosL;
-        int indexL2 = (indexL + 1) % MAX_DELAY;
-        double fracL = readPosL - indexL;
-
-        int indexR = (int)readPosR;
-        int indexR2 = (indexR + 1) % MAX_DELAY;
-        double fracR = readPosR - indexR;
-
-        double wetL = delayLineL[indexL] * (1.0 - fracL) + delayLineL[indexL2] * fracL;
-        double wetR = delayLineR[indexR] * (1.0 - fracR) + delayLineR[indexR2] * fracR;
-
-        outL = input * (1.0 - mix) + wetL * mix;
-        outR = input * (1.0 - mix) + wetR * mix;
-
-        lfoPhase1 += lfoRate1 / sampleRate;
-        lfoPhase2 += lfoRate2 / sampleRate;
-        if (lfoPhase1 >= 1.0) lfoPhase1 -= 1.0;
-        if (lfoPhase2 >= 1.0) lfoPhase2 -= 1.0;
-
-        writeIndex = (writeIndex + 1) % MAX_DELAY;
-    }
-};
-
-// ============================================================================
-// Reverb - Atmosférica
-// ============================================================================
-
-class AtmosphericReverb {
-private:
-    static const int NUM_COMBS = 4;
-    std::vector<std::vector<double>> combBuffers;
-    std::vector<int> combDelays;
-    std::vector<int> combIndices;
-    std::vector<double> combFilters;
-
-    static const int NUM_ALLPASS = 2;
-    std::vector<std::vector<double>> allpassBuffers;
-    std::vector<int> allpassDelays;
-    std::vector<int> allpassIndices;
-
-    double decay;
-    double damping;
-    double sampleRate;
-
-public:
-    AtmosphericReverb(double sr) : sampleRate(sr), decay(0.85), damping(0.3) {
-        combDelays = {1687, 1931, 2053, 2251};
-        allpassDelays = {547, 331};
-
-        double srRatio = sr / 44100.0;
-        for (auto& d : combDelays) d = (int)(d * srRatio);
-        for (auto& d : allpassDelays) d = (int)(d * srRatio);
-
-        combBuffers.resize(NUM_COMBS);
-        combIndices.resize(NUM_COMBS, 0);
-        combFilters.resize(NUM_COMBS, 0.0);
-        for (int i = 0; i < NUM_COMBS; i++) {
-            combBuffers[i].resize(combDelays[i], 0.0);
-        }
-
-        allpassBuffers.resize(NUM_ALLPASS);
-        allpassIndices.resize(NUM_ALLPASS, 0);
-        for (int i = 0; i < NUM_ALLPASS; i++) {
-            allpassBuffers[i].resize(allpassDelays[i], 0.0);
-        }
-    }
-
-    double process(double input, double mix) {
-        double wet = 0.0;
-
-        for (int i = 0; i < NUM_COMBS; i++) {
-            int idx = combIndices[i];
-            double delayed = combBuffers[i][idx];
-            combFilters[i] = delayed * (1.0 - damping) + combFilters[i] * damping;
-            double feedback = combFilters[i] * decay;
-            combBuffers[i][idx] = input + feedback;
-            wet += delayed;
-            combIndices[i] = (idx + 1) % combDelays[i];
-        }
-
-        wet *= 0.25;
-
-        for (int i = 0; i < NUM_ALLPASS; i++) {
-            int idx = allpassIndices[i];
-            double delayed = allpassBuffers[i][idx];
-            double g = 0.5;
-            double output = -g * wet + delayed;
-            allpassBuffers[i][idx] = wet + g * output;
-            wet = output;
-            allpassIndices[i] = (idx + 1) % allpassDelays[i];
-        }
-
-        return input * (1.0 - mix) + wet * mix;
-    }
-};
-
-// ============================================================================
-// Filtro - LP / HP
-// ============================================================================
-
-enum FilterType {
-    FILTER_OFF = 0,
-    FILTER_LOWPASS,
-    FILTER_HIGHPASS
-};
-
-class Filter {
-private:
-    double y1, y2, x1, x2;
-    double a0, a1, a2, b1, b2;
-    double sampleRate;
-
-public:
-    Filter(double sr) : sampleRate(sr), y1(0), y2(0), x1(0), x2(0),
-                        a0(1), a1(0), a2(0), b1(0), b2(0) {}
-
-    void setLowPass(double cutoff, double q) {
-        double w0 = 2.0 * 3.14159265 * cutoff / sampleRate;
-        double cosw0 = std::cos(w0);
-        double sinw0 = std::sin(w0);
-        double alpha = sinw0 / (2.0 * q);
-
-        double b0 = (1.0 - cosw0) / 2.0;
-        double b1_t = 1.0 - cosw0;
-        double b2_t = (1.0 - cosw0) / 2.0;
-        double a0_t = 1.0 + alpha;
-        double a1_t = -2.0 * cosw0;
-        double a2_t = 1.0 - alpha;
-
-        a0 = b0 / a0_t; a1 = b1_t / a0_t; a2 = b2_t / a0_t;
-        b1 = a1_t / a0_t; b2 = a2_t / a0_t;
-    }
-
-    void setHighPass(double cutoff, double q) {
-        double w0 = 2.0 * 3.14159265 * cutoff / sampleRate;
-        double cosw0 = std::cos(w0);
-        double sinw0 = std::sin(w0);
-        double alpha = sinw0 / (2.0 * q);
-
-        double b0 = (1.0 + cosw0) / 2.0;
-        double b1_t = -(1.0 + cosw0);
-        double b2_t = (1.0 + cosw0) / 2.0;
-        double a0_t = 1.0 + alpha;
-        double a1_t = -2.0 * cosw0;
-        double a2_t = 1.0 - alpha;
-
-        a0 = b0 / a0_t; a1 = b1_t / a0_t; a2 = b2_t / a0_t;
-        b1 = a1_t / a0_t; b2 = a2_t / a0_t;
-    }
-
-    double process(double input) {
-        double output = a0 * input + a1 * x1 + a2 * x2 - b1 * y1 - b2 * y2;
-        x2 = x1; x1 = input;
-        y2 = y1; y1 = output;
-        return output;
-    }
-
-    void reset() { y1 = y2 = x1 = x2 = 0.0; }
-};
-
-// ============================================================================
-// Polifonía - 6 voces
-// ============================================================================
-
-const int NUM_VOICES = 6;
-
-struct Voice {
-    std::unique_ptr<FMSynth> synth;
-    int note;
-
-    Voice() : note(-1) {}
-};
+// Headers del synth
+#include "synth/constants.h"
+#include "synth/oscillator.h"
+#include "synth/envelope.h"
+#include "synth/lfo.h"
+#include "synth/filter.h"
+#include "synth/effects.h"
+#include "synth/fm_synth.h"
+#include "synth/waveform_buffer.h"
+#include "synth/voice.h"
+
+// Headers de GUI
+#include "gui/gui_utils.h"
+#include "gui/lfo_dropdown.h"
+#include "gui/presets.h"
 
 // ============================================================================
 // Variables globales
@@ -641,16 +43,75 @@ std::atomic<int> filterType(FILTER_OFF);
 std::atomic<double> filterCutoff(2000.0);
 std::atomic<double> filterQ(0.707);
 
-// GUI params
-float guiRatio1 = 1.0f, guiRatio2 = 2.0f, guiRatio3 = 3.0f, guiRatio4 = 4.0f;
-float guiIndex1 = 0.0f, guiIndex2 = 2.0f, guiIndex3 = 1.5f, guiIndex4 = 1.0f;
-float guiAttack = 0.01f, guiDecay = 0.1f, guiSustain = 0.7f, guiRelease = 0.3f;
+// GUI params (Init preset: pure sine wave)
+float guiRatio1 = 1.0f, guiRatio2 = 1.0f, guiRatio3 = 1.0f, guiRatio4 = 1.0f;
+float guiIndex1 = 0.0f, guiIndex2 = 0.0f, guiIndex3 = 0.0f, guiIndex4 = 0.0f;
+float guiAttack = 0.01f, guiDecay = 0.1f, guiSustain = 1.0f, guiRelease = 0.2f;
 float guiChorus = 0.0f, guiReverb = 0.0f;
 int guiFilterType = 0;
 float guiFilterCutoff = 2000.0f, guiFilterQ = 0.707f;
 int guiAlgorithm = 0;
-int currentOctave = 4;
+int currentOctave = 5;
 std::vector<int> activeNotes;
+
+// LFO params
+float guiLfo1Rate = 2.0f, guiLfo1Depth = 0.0f;
+float guiLfo2Rate = 4.0f, guiLfo2Depth = 0.0f;
+int guiLfo1Target = LFO_OFF, guiLfo2Target = LFO_OFF;
+bool lfo1DropdownOpen = false, lfo2DropdownOpen = false;
+std::unique_ptr<LFO> lfo1, lfo2;
+
+// Mod Envelope params
+float guiModAttack = 0.01f, guiModDecay = 0.3f, guiModSustain = 0.0f, guiModRelease = 0.2f;
+float guiModAmount = 0.0f;
+int guiModEnvTarget = MODENV_OFF;
+bool modEnvDropdownOpen = false;
+
+// Preset system
+Preset presets[NUM_PRESETS];
+int currentPreset = 0;
+
+void saveToPreset(int idx) {
+    if (idx < 0 || idx >= NUM_PRESETS) return;
+    presets[idx].ratio1 = guiRatio1; presets[idx].ratio2 = guiRatio2;
+    presets[idx].ratio3 = guiRatio3; presets[idx].ratio4 = guiRatio4;
+    presets[idx].index1 = guiIndex1; presets[idx].index2 = guiIndex2;
+    presets[idx].index3 = guiIndex3; presets[idx].index4 = guiIndex4;
+    presets[idx].attack = guiAttack; presets[idx].decay = guiDecay;
+    presets[idx].sustain = guiSustain; presets[idx].release = guiRelease;
+    presets[idx].algorithm = guiAlgorithm;
+    presets[idx].filterCutoff = guiFilterCutoff; presets[idx].filterQ = guiFilterQ;
+    presets[idx].filterType = guiFilterType;
+    presets[idx].chorus = guiChorus; presets[idx].reverb = guiReverb;
+    presets[idx].lfo1Rate = guiLfo1Rate; presets[idx].lfo1Depth = guiLfo1Depth;
+    presets[idx].lfo2Rate = guiLfo2Rate; presets[idx].lfo2Depth = guiLfo2Depth;
+    presets[idx].lfo1Target = guiLfo1Target; presets[idx].lfo2Target = guiLfo2Target;
+    presets[idx].modAttack = guiModAttack; presets[idx].modDecay = guiModDecay;
+    presets[idx].modSustain = guiModSustain; presets[idx].modRelease = guiModRelease;
+    presets[idx].modAmount = guiModAmount;
+    presets[idx].modEnvTarget = guiModEnvTarget;
+}
+
+void loadFromPreset(int idx) {
+    if (idx < 0 || idx >= NUM_PRESETS) return;
+    guiRatio1 = presets[idx].ratio1; guiRatio2 = presets[idx].ratio2;
+    guiRatio3 = presets[idx].ratio3; guiRatio4 = presets[idx].ratio4;
+    guiIndex1 = presets[idx].index1; guiIndex2 = presets[idx].index2;
+    guiIndex3 = presets[idx].index3; guiIndex4 = presets[idx].index4;
+    guiAttack = presets[idx].attack; guiDecay = presets[idx].decay;
+    guiSustain = presets[idx].sustain; guiRelease = presets[idx].release;
+    guiAlgorithm = presets[idx].algorithm;
+    guiFilterCutoff = presets[idx].filterCutoff; guiFilterQ = presets[idx].filterQ;
+    guiFilterType = presets[idx].filterType;
+    guiChorus = presets[idx].chorus; guiReverb = presets[idx].reverb;
+    guiLfo1Rate = presets[idx].lfo1Rate; guiLfo1Depth = presets[idx].lfo1Depth;
+    guiLfo2Rate = presets[idx].lfo2Rate; guiLfo2Depth = presets[idx].lfo2Depth;
+    guiLfo1Target = presets[idx].lfo1Target; guiLfo2Target = presets[idx].lfo2Target;
+    guiModAttack = presets[idx].modAttack; guiModDecay = presets[idx].modDecay;
+    guiModSustain = presets[idx].modSustain; guiModRelease = presets[idx].modRelease;
+    guiModAmount = presets[idx].modAmount;
+    guiModEnvTarget = presets[idx].modEnvTarget;
+}
 
 // ============================================================================
 // Voice management
@@ -688,6 +149,13 @@ void voiceNoteOff(int note) {
         voices[v].synth->noteOff();
         voices[v].note = -1;
     }
+}
+
+bool isNoteActive(int note) {
+    for (int v = 0; v < NUM_VOICES; v++) {
+        if (voices[v].note == note) return true;
+    }
+    return false;
 }
 
 // ============================================================================
@@ -741,305 +209,12 @@ double midiToFreq(int midiNote) {
 }
 
 // ============================================================================
-// GUI Drawing functions
-// ============================================================================
-
-void DrawVerticalSlider(int x, int y, int height, const char* label, float* value, float minVal, float maxVal, Color trackColor) {
-    int labelWidth = MeasureText(label, 10);
-    DrawText(label, x + 15 - labelWidth / 2, y, 10, WHITE);
-
-    int trackX = x + 10;
-    int trackY = y + 14;
-    int trackWidth = 10;
-    DrawRectangle(trackX, trackY, trackWidth, height, Color{40, 40, 50, 255});
-    DrawRectangleLines(trackX, trackY, trackWidth, height, DARKGRAY);
-
-    float normalized = (*value - minVal) / (maxVal - minVal);
-    int fillHeight = (int)(normalized * height);
-    DrawRectangle(trackX + 1, trackY + height - fillHeight, trackWidth - 2, fillHeight, trackColor);
-
-    int handleY = trackY + height - (int)(normalized * height) - 3;
-    DrawRectangle(trackX - 2, handleY, trackWidth + 4, 6, RAYWHITE);
-
-    char valueText[16];
-    snprintf(valueText, sizeof(valueText), "%.2f", *value);
-    int valWidth = MeasureText(valueText, 9);
-    DrawText(valueText, x + 15 - valWidth / 2, trackY + height + 4, 9, GRAY);
-
-    if (IsMouseButtonDown(MOUSE_LEFT_BUTTON)) {
-        Vector2 mouse = GetMousePosition();
-        if (mouse.x >= trackX - 5 && mouse.x <= trackX + trackWidth + 5 &&
-            mouse.y >= trackY && mouse.y <= trackY + height) {
-            float newNormalized = 1.0f - (mouse.y - trackY) / (float)height;
-            newNormalized = fmaxf(0.0f, fminf(1.0f, newNormalized));
-            *value = minVal + newNormalized * (maxVal - minVal);
-        }
-    }
-}
-
-void DrawOperatorPanel(int x, int y, const char* name, float* ratio, float* index,
-                       Color color, bool isCarrier, const char* indexLabel) {
-    int panelWidth = 70;
-    int panelHeight = 115;
-
-    DrawRectangle(x, y, panelWidth, panelHeight, Color{35, 35, 45, 255});
-    DrawRectangleLines(x, y, panelWidth, panelHeight, color);
-
-    int nameWidth = MeasureText(name, 12);
-    DrawText(name, x + (panelWidth - nameWidth) / 2, y + 4, 12, color);
-
-    const char* typeLabel = isCarrier ? "[C]" : "[M]";
-    int typeWidth = MeasureText(typeLabel, 9);
-    DrawText(typeLabel, x + (panelWidth - typeWidth) / 2, y + 18, 9, isCarrier ? Color{180, 100, 60, 255} : Color{60, 120, 180, 255});
-
-    DrawVerticalSlider(x + 3, y + 30, 55, "R", ratio, 0.5f, 8.0f, color);
-    DrawVerticalSlider(x + 36, y + 30, 55, indexLabel, index, 0.0f, 10.0f, color);
-}
-
-void DrawADSRPanel(int x, int y, float* a, float* d, float* s, float* r) {
-    int panelWidth = 160;
-    int panelHeight = 115;
-
-    DrawRectangle(x, y, panelWidth, panelHeight, Color{35, 35, 45, 255});
-    DrawRectangleLines(x, y, panelWidth, panelHeight, Color{200, 180, 100, 255});
-    DrawText("ENVELOPE", x + 50, y + 4, 11, Color{200, 180, 100, 255});
-
-    // ADSR sliders
-    DrawVerticalSlider(x + 5, y + 20, 50, "A", a, 0.001f, 2.0f, Color{100, 200, 100, 255});
-    DrawVerticalSlider(x + 40, y + 20, 50, "D", d, 0.001f, 2.0f, Color{200, 200, 100, 255});
-    DrawVerticalSlider(x + 75, y + 20, 50, "S", s, 0.0f, 1.0f, Color{100, 150, 200, 255});
-    DrawVerticalSlider(x + 110, y + 20, 50, "R", r, 0.001f, 3.0f, Color{200, 100, 100, 255});
-
-    // ADSR Graph
-    int graphX = x + 5;
-    int graphY = y + 85;
-    int graphW = 150;
-    int graphH = 25;
-
-    DrawRectangle(graphX, graphY, graphW, graphH, Color{25, 25, 35, 255});
-    DrawRectangleLines(graphX, graphY, graphW, graphH, Color{60, 60, 80, 255});
-
-    // Calculate ADSR points
-    float totalTime = *a + *d + 0.3f + *r; // 0.3s for sustain display
-    float scale = graphW / totalTime;
-
-    int attackEnd = graphX + (int)(*a * scale);
-    int decayEnd = attackEnd + (int)(*d * scale);
-    int sustainEnd = decayEnd + (int)(0.3f * scale);
-    int releaseEnd = sustainEnd + (int)(*r * scale);
-    if (releaseEnd > graphX + graphW) releaseEnd = graphX + graphW;
-
-    int baseY = graphY + graphH - 2;
-    int peakY = graphY + 2;
-    int sustainY = graphY + graphH - 2 - (int)((*s) * (graphH - 4));
-
-    // Draw envelope shape
-    DrawLine(graphX, baseY, attackEnd, peakY, Color{100, 200, 100, 255});  // Attack
-    DrawLine(attackEnd, peakY, decayEnd, sustainY, Color{200, 200, 100, 255});  // Decay
-    DrawLine(decayEnd, sustainY, sustainEnd, sustainY, Color{100, 150, 200, 255});  // Sustain
-    DrawLine(sustainEnd, sustainY, releaseEnd, baseY, Color{200, 100, 100, 255});  // Release
-}
-
-void DrawAlgorithmDiagram(int x, int y, int algorithm) {
-    int boxW = 22, boxH = 16;
-    Color opColor = Color{60, 120, 180, 255};
-    Color carrierColor = Color{180, 100, 60, 255};
-
-    DrawRectangle(x - 5, y - 5, 105, 50, Color{30, 30, 40, 255});
-
-    switch (algorithm) {
-        case ALG_STACK:
-            // 4 -> 3 -> 2 -> 1
-            for (int i = 0; i < 4; i++) {
-                int bx = x + i * 26;
-                Color c = (i == 3) ? carrierColor : opColor;
-                DrawRectangle(bx, y + 12, boxW, boxH, c);
-                char num[2] = {(char)('4' - i), 0};
-                DrawText(num, bx + 8, y + 14, 12, WHITE);
-                if (i < 3) DrawText(">", bx + 23, y + 14, 10, GRAY);
-            }
-            break;
-
-        case ALG_TWIN:
-            DrawRectangle(x, y + 2, boxW, boxH, opColor);
-            DrawText("4", x + 8, y + 4, 12, WHITE);
-            DrawText(">", x + 23, y + 4, 10, GRAY);
-            DrawRectangle(x + 28, y + 2, boxW, boxH, opColor);
-            DrawText("3", x + 36, y + 4, 12, WHITE);
-            DrawRectangle(x + 28, y + 22, boxW, boxH, opColor);
-            DrawText("2", x + 36, y + 24, 12, WHITE);
-            DrawText(">", x + 55, y + 12, 10, GRAY);
-            DrawRectangle(x + 65, y + 12, boxW, boxH, carrierColor);
-            DrawText("1", x + 73, y + 14, 12, WHITE);
-            break;
-
-        case ALG_BRANCH:
-            DrawRectangle(x, y + 12, boxW, boxH, opColor);
-            DrawText("4", x + 8, y + 14, 12, WHITE);
-            DrawLine(x + 24, y + 18, x + 35, y + 8, GRAY);
-            DrawLine(x + 24, y + 22, x + 35, y + 32, GRAY);
-            DrawRectangle(x + 38, y, boxW, boxH, opColor);
-            DrawText("3", x + 46, y + 2, 12, WHITE);
-            DrawRectangle(x + 38, y + 24, boxW, boxH, opColor);
-            DrawText("2", x + 46, y + 26, 12, WHITE);
-            DrawText(">", x + 62, y + 12, 10, GRAY);
-            DrawRectangle(x + 72, y + 12, boxW, boxH, carrierColor);
-            DrawText("1", x + 80, y + 14, 12, WHITE);
-            break;
-
-        case ALG_PARALLEL:
-            for (int i = 0; i < 3; i++) {
-                DrawRectangle(x, y + i * 14, boxW, boxH - 2, opColor);
-                char num[2] = {(char)('4' - i), 0};
-                DrawText(num, x + 8, y + i * 14, 10, WHITE);
-            }
-            DrawText(">", x + 28, y + 14, 10, GRAY);
-            DrawRectangle(x + 40, y + 12, boxW, boxH, carrierColor);
-            DrawText("1", x + 48, y + 14, 12, WHITE);
-            break;
-
-        case ALG_DUAL_CARRIER:
-            DrawRectangle(x, y + 2, boxW, boxH, opColor);
-            DrawText("4", x + 8, y + 4, 12, WHITE);
-            DrawText(">", x + 23, y + 4, 10, GRAY);
-            DrawRectangle(x + 30, y + 2, boxW, boxH, carrierColor);
-            DrawText("3", x + 38, y + 4, 12, WHITE);
-            DrawRectangle(x + 60, y + 2, boxW, boxH, opColor);
-            DrawText("2", x + 68, y + 4, 12, WHITE);
-            DrawText(">", x + 83, y + 4, 10, GRAY);
-            DrawRectangle(x + 60, y + 22, boxW, boxH, carrierColor);
-            DrawText("1", x + 68, y + 24, 12, WHITE);
-            break;
-
-        case ALG_TRIPLE:
-            DrawRectangle(x, y + 12, boxW, boxH, opColor);
-            DrawText("4", x + 8, y + 14, 12, WHITE);
-            DrawLine(x + 24, y + 16, x + 35, y + 6, GRAY);
-            DrawLine(x + 24, y + 20, x + 35, y + 20, GRAY);
-            DrawLine(x + 24, y + 24, x + 35, y + 34, GRAY);
-            DrawRectangle(x + 38, y, boxW, boxH, carrierColor);
-            DrawText("1", x + 46, y + 2, 12, WHITE);
-            DrawRectangle(x + 38, y + 16, boxW, boxH, carrierColor);
-            DrawText("2", x + 46, y + 18, 12, WHITE);
-            DrawRectangle(x + 38, y + 32, boxW, boxH, carrierColor);
-            DrawText("3", x + 46, y + 34, 12, WHITE);
-            break;
-    }
-}
-
-void DrawWaveform(int x, int y, int width, int height) {
-    DrawRectangle(x, y, width, height, Color{20, 20, 30, 255});
-    DrawRectangleLines(x, y, width, height, DARKGRAY);
-
-    int centerY = y + height / 2;
-    DrawLine(x, centerY, x + width, centerY, Color{60, 60, 80, 255});
-
-    int bufferSize = waveformBuffer->getSize();
-    float xStep = (float)width / bufferSize;
-
-    for (int i = 0; i < bufferSize - 1; i++) {
-        float sample1 = waveformBuffer->read(i);
-        float sample2 = waveformBuffer->read(i + 1);
-
-        int y1 = centerY - (int)(sample1 * height * 0.4f);
-        int y2 = centerY - (int)(sample2 * height * 0.4f);
-
-        DrawLine(x + (int)(i * xStep), y1, x + (int)((i + 1) * xStep), y2, GREEN);
-    }
-}
-
-void DrawPianoKey(int x, int y, int width, int height, bool isBlack, bool isPressed, int noteIndex) {
-    Color keyColor;
-    if (isPressed) {
-        keyColor = isBlack ? Color{80, 80, 200, 255} : Color{100, 100, 255, 255};
-    } else {
-        keyColor = isBlack ? Color{30, 30, 30, 255} : RAYWHITE;
-    }
-
-    DrawRectangle(x, y, width, height, keyColor);
-    DrawRectangleLines(x, y, width, height, DARKGRAY);
-}
-
-bool isNoteActive(int note) {
-    for (int v = 0; v < NUM_VOICES; v++) {
-        if (voices[v].note == note) return true;
-    }
-    return false;
-}
-
-void DrawPiano(int x, int y, int* pressedNote) {
-    const int whiteKeyWidth = 28;
-    const int whiteKeyHeight = 70;
-    const int blackKeyWidth = 18;
-    const int blackKeyHeight = 42;
-
-    const int numWhiteKeys = 15;
-    const int whiteNotes[] = {0, 2, 4, 5, 7, 9, 11, 12, 14, 16, 17, 19, 21, 23, 24};
-
-    const int numBlackKeys = 10;
-    const int blackNotes[] = {1, 3, 6, 8, 10, 13, 15, 18, 20, 22};
-    const int blackPositions[] = {0, 1, 3, 4, 5, 7, 8, 10, 11, 12};
-
-    int baseMidi = 12 * currentOctave;
-
-    Vector2 mouse = GetMousePosition();
-    bool mouseDown = IsMouseButtonDown(MOUSE_LEFT_BUTTON);
-
-    *pressedNote = -1;
-
-    for (int i = 0; i < numWhiteKeys; i++) {
-        int keyX = x + i * whiteKeyWidth;
-        int midiNote = baseMidi + whiteNotes[i];
-        bool isPressed = isNoteActive(midiNote);
-
-        if (mouseDown && mouse.x >= keyX && mouse.x < keyX + whiteKeyWidth &&
-            mouse.y >= y && mouse.y < y + whiteKeyHeight) {
-            bool onBlackKey = false;
-            for (int j = 0; j < numBlackKeys; j++) {
-                int bkX = x + blackPositions[j] * whiteKeyWidth + whiteKeyWidth - blackKeyWidth / 2;
-                if (mouse.x >= bkX && mouse.x < bkX + blackKeyWidth &&
-                    mouse.y >= y && mouse.y < y + blackKeyHeight) {
-                    onBlackKey = true;
-                    break;
-                }
-            }
-            if (!onBlackKey) {
-                *pressedNote = midiNote;
-                isPressed = true;
-            }
-        }
-
-        DrawPianoKey(keyX, y, whiteKeyWidth - 2, whiteKeyHeight, false, isPressed, i);
-
-        if (whiteNotes[i] % 12 == 0) {
-            char noteLabel[8];
-            snprintf(noteLabel, sizeof(noteLabel), "C%d", (baseMidi + whiteNotes[i]) / 12);
-            int textWidth = MeasureText(noteLabel, 9);
-            DrawText(noteLabel, keyX + (whiteKeyWidth - textWidth) / 2, y + whiteKeyHeight - 12, 9, BLACK);
-        }
-    }
-
-    for (int i = 0; i < numBlackKeys; i++) {
-        int keyX = x + blackPositions[i] * whiteKeyWidth + whiteKeyWidth - blackKeyWidth / 2;
-        int midiNote = baseMidi + blackNotes[i];
-        bool isPressed = isNoteActive(midiNote);
-
-        if (mouseDown && mouse.x >= keyX && mouse.x < keyX + blackKeyWidth &&
-            mouse.y >= y && mouse.y < y + blackKeyHeight) {
-            *pressedNote = midiNote;
-            isPressed = true;
-        }
-
-        DrawPianoKey(keyX, y, blackKeyWidth, blackKeyHeight, true, isPressed, i);
-    }
-}
-
-// ============================================================================
 // Main
 // ============================================================================
 
 int main() {
     srand((unsigned int)time(NULL));
+    initPresets(presets);
 
     for (int i = 0; i < NUM_VOICES; i++) {
         voices[i].synth = std::make_unique<FMSynth>(440.0, SAMPLE_RATE);
@@ -1052,6 +227,8 @@ int main() {
     reverbR = std::make_unique<AtmosphericReverb>(SAMPLE_RATE);
     filterL = std::make_unique<Filter>(SAMPLE_RATE);
     filterR = std::make_unique<Filter>(SAMPLE_RATE);
+    lfo1 = std::make_unique<LFO>(60.0);
+    lfo2 = std::make_unique<LFO>(60.0);
 
     RtAudio dac;
 
@@ -1082,12 +259,13 @@ int main() {
         return 1;
     }
 
-    const int screenWidth = 1050;
-    const int screenHeight = 430;
+    const int screenWidth = 650;
+    const int screenHeight = 520;
 
-    InitWindow(screenWidth, screenHeight, "FM Synth - 4 Operators / 6 Voices / ADSR");
+    InitWindow(screenWidth, screenHeight, "FM Synth - 4 Op / 16 Voices");
     SetTargetFPS(60);
 
+    // Mapeo de teclado
     const int whiteKeyMapping[] = { KEY_A, KEY_S, KEY_D, KEY_F, KEY_G, KEY_H, KEY_J, KEY_K, KEY_L, KEY_SEMICOLON };
     const int whiteKeyNotes[] = { 0, 2, 4, 5, 7, 9, 11, 12, 14, 16 };
     const int numWhiteKeysMap = 10;
@@ -1096,17 +274,68 @@ int main() {
     const int blackKeyNotes[] = { 1, 3, 6, 8, 10, 13, 15 };
     const int numBlackKeysMap = 7;
 
+    // Constantes de layout
+    const int ROW1_Y = 40;
+    const int ROW_H = 120;
+
     while (!WindowShouldClose()) {
-        // Update all voices
+        // Process LFOs
+        float lfo1Val = lfo1->process(guiLfo1Rate, guiLfo1Depth);
+        float lfo2Val = lfo2->process(guiLfo2Rate, guiLfo2Depth);
+
+        // Apply LFO modulation
+        float modRatio1 = applyLfoMod(guiRatio1, LFO_RATIO1, guiLfo1Target, lfo1Val, 0.5f, 8.0f);
+        modRatio1 = applyLfoMod(modRatio1, LFO_RATIO1, guiLfo2Target, lfo2Val, 0.5f, 8.0f);
+        float modRatio2 = applyLfoMod(guiRatio2, LFO_RATIO2, guiLfo1Target, lfo1Val, 0.5f, 8.0f);
+        modRatio2 = applyLfoMod(modRatio2, LFO_RATIO2, guiLfo2Target, lfo2Val, 0.5f, 8.0f);
+        float modRatio3 = applyLfoMod(guiRatio3, LFO_RATIO3, guiLfo1Target, lfo1Val, 0.5f, 8.0f);
+        modRatio3 = applyLfoMod(modRatio3, LFO_RATIO3, guiLfo2Target, lfo2Val, 0.5f, 8.0f);
+        float modRatio4 = applyLfoMod(guiRatio4, LFO_RATIO4, guiLfo1Target, lfo1Val, 0.5f, 8.0f);
+        modRatio4 = applyLfoMod(modRatio4, LFO_RATIO4, guiLfo2Target, lfo2Val, 0.5f, 8.0f);
+
+        float modIndex1 = applyLfoMod(guiIndex1, LFO_INDEX1, guiLfo1Target, lfo1Val, 0.0f, 10.0f);
+        modIndex1 = applyLfoMod(modIndex1, LFO_INDEX1, guiLfo2Target, lfo2Val, 0.0f, 10.0f);
+        float modIndex2 = applyLfoMod(guiIndex2, LFO_INDEX2, guiLfo1Target, lfo1Val, 0.0f, 10.0f);
+        modIndex2 = applyLfoMod(modIndex2, LFO_INDEX2, guiLfo2Target, lfo2Val, 0.0f, 10.0f);
+        float modIndex3 = applyLfoMod(guiIndex3, LFO_INDEX3, guiLfo1Target, lfo1Val, 0.0f, 10.0f);
+        modIndex3 = applyLfoMod(modIndex3, LFO_INDEX3, guiLfo2Target, lfo2Val, 0.0f, 10.0f);
+        float modIndex4 = applyLfoMod(guiIndex4, LFO_INDEX4, guiLfo1Target, lfo1Val, 0.0f, 10.0f);
+        modIndex4 = applyLfoMod(modIndex4, LFO_INDEX4, guiLfo2Target, lfo2Val, 0.0f, 10.0f);
+
+        float modFilterCut = applyLfoMod(guiFilterCutoff, LFO_FILTER_CUT, guiLfo1Target, lfo1Val, 100.0f, 8000.0f);
+        modFilterCut = applyLfoMod(modFilterCut, LFO_FILTER_CUT, guiLfo2Target, lfo2Val, 100.0f, 8000.0f);
+        float modFilterQ = applyLfoMod(guiFilterQ, LFO_FILTER_Q, guiLfo1Target, lfo1Val, 0.5f, 8.0f);
+        modFilterQ = applyLfoMod(modFilterQ, LFO_FILTER_Q, guiLfo2Target, lfo2Val, 0.5f, 8.0f);
+
+        float modChorus = applyLfoMod(guiChorus, LFO_CHORUS, guiLfo1Target, lfo1Val, 0.0f, 1.0f);
+        modChorus = applyLfoMod(modChorus, LFO_CHORUS, guiLfo2Target, lfo2Val, 0.0f, 1.0f);
+        float modReverb = applyLfoMod(guiReverb, LFO_REVERB, guiLfo1Target, lfo1Val, 0.0f, 1.0f);
+        modReverb = applyLfoMod(modReverb, LFO_REVERB, guiLfo2Target, lfo2Val, 0.0f, 1.0f);
+
+        // Apply Mod Envelope modulation (basado en guiModAmount)
+        float modEnvValue = guiModAmount;  // El amount actua como multiplicador
+        if (guiModEnvTarget == MODENV_INDEX1) {
+            modIndex1 = std::max(0.0f, std::min(10.0f, modIndex1 + modEnvValue * 5.0f));
+        } else if (guiModEnvTarget == MODENV_INDEX2) {
+            modIndex2 = std::max(0.0f, std::min(10.0f, modIndex2 + modEnvValue * 5.0f));
+        } else if (guiModEnvTarget == MODENV_INDEX3) {
+            modIndex3 = std::max(0.0f, std::min(10.0f, modIndex3 + modEnvValue * 5.0f));
+        } else if (guiModEnvTarget == MODENV_INDEX4) {
+            modIndex4 = std::max(0.0f, std::min(10.0f, modIndex4 + modEnvValue * 5.0f));
+        } else if (guiModEnvTarget == MODENV_FILTER_CUT) {
+            modFilterCut = std::max(100.0f, std::min(8000.0f, modFilterCut + modEnvValue * 4000.0f));
+        }
+
+        // Update voices
         for (int v = 0; v < NUM_VOICES; v++) {
-            voices[v].synth->setRatio1(guiRatio1);
-            voices[v].synth->setRatio2(guiRatio2);
-            voices[v].synth->setRatio3(guiRatio3);
-            voices[v].synth->setRatio4(guiRatio4);
-            voices[v].synth->setIndex1(guiIndex1);
-            voices[v].synth->setIndex2(guiIndex2);
-            voices[v].synth->setIndex3(guiIndex3);
-            voices[v].synth->setIndex4(guiIndex4);
+            voices[v].synth->setRatio1(modRatio1);
+            voices[v].synth->setRatio2(modRatio2);
+            voices[v].synth->setRatio3(modRatio3);
+            voices[v].synth->setRatio4(modRatio4);
+            voices[v].synth->setIndex1(modIndex1);
+            voices[v].synth->setIndex2(modIndex2);
+            voices[v].synth->setIndex3(modIndex3);
+            voices[v].synth->setIndex4(modIndex4);
             voices[v].synth->setAlgorithm(guiAlgorithm);
             voices[v].synth->setAttack(guiAttack);
             voices[v].synth->setDecay(guiDecay);
@@ -1114,29 +343,27 @@ int main() {
             voices[v].synth->setRelease(guiRelease);
         }
 
-        chorusMix.store(guiChorus);
-        reverbMix.store(guiReverb);
-
+        chorusMix.store(modChorus);
+        reverbMix.store(modReverb);
         filterType.store(guiFilterType);
         if (guiFilterType == FILTER_LOWPASS) {
-            filterL->setLowPass(guiFilterCutoff, guiFilterQ);
-            filterR->setLowPass(guiFilterCutoff, guiFilterQ);
+            filterL->setLowPass(modFilterCut, modFilterQ);
+            filterR->setLowPass(modFilterCut, modFilterQ);
         } else if (guiFilterType == FILTER_HIGHPASS) {
-            filterL->setHighPass(guiFilterCutoff, guiFilterQ);
-            filterR->setHighPass(guiFilterCutoff, guiFilterQ);
+            filterL->setHighPass(modFilterCut, modFilterQ);
+            filterR->setHighPass(modFilterCut, modFilterQ);
         }
 
+        // Keyboard input
         std::vector<int> currentKeys;
         for (int i = 0; i < numWhiteKeysMap; i++) {
             if (IsKeyDown(whiteKeyMapping[i])) {
-                int note = 12 * currentOctave + whiteKeyNotes[i];
-                currentKeys.push_back(note);
+                currentKeys.push_back(12 * currentOctave + whiteKeyNotes[i]);
             }
         }
         for (int i = 0; i < numBlackKeysMap; i++) {
             if (IsKeyDown(blackKeyMapping[i])) {
-                int note = 12 * currentOctave + blackKeyNotes[i];
-                currentKeys.push_back(note);
+                currentKeys.push_back(12 * currentOctave + blackKeyNotes[i]);
             }
         }
 
@@ -1148,188 +375,350 @@ int main() {
         BeginDrawing();
         ClearBackground(Color{25, 25, 35, 255});
 
-        // HEADER
-        DrawText("FM SYNTH", 20, 10, 26, WHITE);
-        DrawText("4 Op / 6 Voices / ADSR", screenWidth - 180, 15, 12, GRAY);
-        DrawLine(20, 40, screenWidth - 20, 40, DARKGRAY);
+        // ==================== HEADER ====================
+        DrawText("FM SYNTH", 15, 10, 20, WHITE);
+        DrawLine(15, 32, screenWidth - 15, 32, Color{50, 50, 60, 255});
 
-        // ROW 1: 4 OPERATORS
+        // ==================== FILA 1: OPERADORES + ENVOLVENTES ====================
         Color op1Color = Color{180, 100, 60, 255};
         Color op2Color = Color{60, 120, 180, 255};
         Color op3Color = Color{100, 180, 100, 255};
         Color op4Color = Color{180, 100, 180, 255};
 
-        DrawOperatorPanel(20, 50, "OP 1", &guiRatio1, &guiIndex1, op1Color, true, "FB");
-        DrawOperatorPanel(100, 50, "OP 2", &guiRatio2, &guiIndex2, op2Color, false, "I");
-        DrawOperatorPanel(180, 50, "OP 3", &guiRatio3, &guiIndex3, op3Color, false, "I");
-        DrawOperatorPanel(260, 50, "OP 4", &guiRatio4, &guiIndex4, op4Color, false, "I");
+        DrawOperatorPanel(15, ROW1_Y, "OP1", &guiRatio1, &guiIndex1, op1Color, true, "FB");
+        DrawOperatorPanel(90, ROW1_Y, "OP2", &guiRatio2, &guiIndex2, op2Color, false, "I");
+        DrawOperatorPanel(165, ROW1_Y, "OP3", &guiRatio3, &guiIndex3, op3Color, false, "I");
+        DrawOperatorPanel(240, ROW1_Y, "OP4", &guiRatio4, &guiIndex4, op4Color, false, "I");
 
         // ADSR Panel
-        DrawADSRPanel(345, 50, &guiAttack, &guiDecay, &guiSustain, &guiRelease);
+        DrawADSRPanel(320, ROW1_Y, &guiAttack, &guiDecay, &guiSustain, &guiRelease, "ADSR", Color{200, 180, 100, 255});
 
-        // ALGORITHM Panel
-        DrawRectangle(520, 50, 160, 115, Color{30, 30, 40, 255});
-        DrawRectangleLines(520, 50, 160, 115, Color{80, 80, 100, 255});
-        DrawText("ALGORITHM", 565, 55, 10, Color{80, 80, 100, 255});
+        // ==================== FILA 2: FILTER + LFO1 + LFO2 + FX + MOD ENV ====================
+        int row2Y = ROW1_Y + 120;
+        int panelH = 140;
 
-        // Algorithm buttons (2x3 grid)
-        for (int i = 0; i < ALG_COUNT; i++) {
-            int col = i % 3;
-            int row = i / 3;
-            int btnX = 528 + col * 50;
-            int btnY = 70 + row * 24;
-            bool isSelected = (guiAlgorithm == i);
-            Color btnColor = isSelected ? Color{80, 80, 180, 255} : Color{50, 50, 60, 255};
-            DrawRectangle(btnX, btnY, 46, 20, btnColor);
-            DrawRectangleLines(btnX, btnY, 46, 20, isSelected ? WHITE : DARKGRAY);
-            int tw = MeasureText(algorithmNames[i], 9);
-            DrawText(algorithmNames[i], btnX + (46 - tw) / 2, btnY + 5, 9, isSelected ? WHITE : GRAY);
+        // Filter Panel (alineado con OP1)
+        {
+            int px = 15, py = row2Y, pw = 70;
+            DrawRectangle(px, py, pw, panelH, Color{35, 35, 45, 255});
+            DrawRectangleLines(px, py, pw, panelH, Color{200, 100, 150, 255});
+            DrawText("FILTER", px + 14, py + 4, 10, Color{200, 100, 150, 255});
 
-            if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
-                Vector2 mouse = GetMousePosition();
-                if (mouse.x >= btnX && mouse.x <= btnX + 46 && mouse.y >= btnY && mouse.y <= btnY + 20) {
-                    guiAlgorithm = i;
-                }
-            }
-        }
-
-        DrawAlgorithmDiagram(535, 118, guiAlgorithm);
-
-        // FILTER Panel
-        DrawRectangle(695, 50, 110, 115, Color{35, 35, 45, 255});
-        DrawRectangleLines(695, 50, 110, 115, Color{200, 100, 150, 255});
-        DrawText("FILTER", 730, 55, 10, Color{200, 100, 150, 255});
-
-        const char* filterNames[] = {"OFF", "LP", "HP"};
-        for (int i = 0; i < 3; i++) {
-            int btnX = 703 + i * 34;
-            int btnY = 70;
-            bool isSelected = (guiFilterType == i);
-            Color btnColor = isSelected ? Color{200, 100, 150, 255} : Color{50, 50, 60, 255};
-            DrawRectangle(btnX, btnY, 30, 18, btnColor);
-            DrawRectangleLines(btnX, btnY, 30, 18, isSelected ? WHITE : DARKGRAY);
-            int tw = MeasureText(filterNames[i], 10);
-            DrawText(filterNames[i], btnX + (30 - tw) / 2, btnY + 4, 10, isSelected ? WHITE : GRAY);
-
-            if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
-                Vector2 mouse = GetMousePosition();
-                if (mouse.x >= btnX && mouse.x <= btnX + 30 && mouse.y >= btnY && mouse.y <= btnY + 18) {
+            const char* fn[] = {"OFF", "LP", "HP"};
+            for (int i = 0; i < 3; i++) {
+                int btnX = px + 5 + i * 21, btnY = py + 18;
+                bool sel = (guiFilterType == i);
+                DrawRectangle(btnX, btnY, 19, 14, sel ? Color{200, 100, 150, 255} : Color{45, 45, 55, 255});
+                DrawRectangleLines(btnX, btnY, 19, 14, sel ? WHITE : DARKGRAY);
+                int tw = MeasureText(fn[i], 8);
+                DrawText(fn[i], btnX + (19 - tw) / 2, btnY + 3, 8, sel ? WHITE : GRAY);
+                Vector2 m = GetMousePosition();
+                if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON) && m.x >= btnX && m.x <= btnX + 19 && m.y >= btnY && m.y <= btnY + 14) {
                     guiFilterType = i;
                 }
             }
+            DrawVerticalSlider(px + 3, py + 38, 70, "Cut", &guiFilterCutoff, 100.0f, 8000.0f, Color{200, 100, 150, 255});
+            DrawVerticalSlider(px + 36, py + 38, 70, "Res", &guiFilterQ, 0.5f, 8.0f, Color{200, 100, 150, 255});
         }
 
-        DrawVerticalSlider(705, 95, 45, "Cut", &guiFilterCutoff, 100.0f, 8000.0f, Color{200, 100, 150, 255});
-        DrawVerticalSlider(755, 95, 45, "Res", &guiFilterQ, 0.5f, 8.0f, Color{200, 100, 150, 255});
-
-        // EFFECTS Panel
-        DrawRectangle(820, 50, 90, 115, Color{35, 35, 45, 255});
-        DrawRectangleLines(820, 50, 90, 115, Color{150, 100, 180, 255});
-        DrawText("EFFECTS", 840, 55, 10, Color{150, 100, 180, 255});
-
-        DrawVerticalSlider(830, 72, 55, "Cho", &guiChorus, 0.0f, 1.0f, Color{100, 180, 220, 255});
-        DrawVerticalSlider(865, 72, 55, "Rev", &guiReverb, 0.0f, 1.0f, Color{220, 150, 100, 255});
-
-        // RANDOMIZE Button
+        // LFO 1 Panel - perillas verticales con dropdown abajo
+        int lfo1PanelX = 90, lfo1PanelY = row2Y;
         {
-            int btnX = 925, btnY = 50, btnW = 100, btnH = 30;
-            bool hover = false;
-            Vector2 mouse = GetMousePosition();
-            if (mouse.x >= btnX && mouse.x <= btnX + btnW && mouse.y >= btnY && mouse.y <= btnY + btnH) {
-                hover = true;
-                if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
-                    guiRatio1 = 0.5f + (float)(rand() % 150) / 20.0f;
-                    guiRatio2 = 0.5f + (float)(rand() % 150) / 20.0f;
-                    guiRatio3 = 0.5f + (float)(rand() % 150) / 20.0f;
-                    guiRatio4 = 0.5f + (float)(rand() % 150) / 20.0f;
-                    guiIndex1 = (float)(rand() % 50) / 10.0f;
-                    guiIndex2 = (float)(rand() % 100) / 10.0f;
-                    guiIndex3 = (float)(rand() % 100) / 10.0f;
-                    guiIndex4 = (float)(rand() % 100) / 10.0f;
-                    guiAttack = 0.001f + (float)(rand() % 500) / 1000.0f;
-                    guiDecay = 0.01f + (float)(rand() % 500) / 500.0f;
-                    guiSustain = 0.2f + (float)(rand() % 80) / 100.0f;
-                    guiRelease = 0.05f + (float)(rand() % 200) / 100.0f;
-                    guiAlgorithm = rand() % ALG_COUNT;
+            int pw = 70;
+            Color lfo1Color = Color{100, 180, 180, 255};
+            DrawRectangle(lfo1PanelX, lfo1PanelY, pw, panelH, Color{35, 35, 45, 255});
+            DrawRectangleLines(lfo1PanelX, lfo1PanelY, pw, panelH, lfo1Color);
+            DrawText("LFO 1", lfo1PanelX + 20, lfo1PanelY + 4, 10, lfo1Color);
+
+            // Knobs uno encima del otro con mas espacio
+            DrawKnob(lfo1PanelX + 35, lfo1PanelY + 38, 13, "Rate", &guiLfo1Rate, 0.1f, 20.0f, lfo1Color);
+            DrawKnob(lfo1PanelX + 35, lfo1PanelY + 90, 13, "Depth", &guiLfo1Depth, 0.0f, 1.0f, lfo1Color);
+            DrawLfoDropdown(lfo1PanelX + 8, lfo1PanelY + 120, 54, &guiLfo1Target, &lfo1DropdownOpen, "");
+        }
+
+        // LFO 2 Panel
+        int lfo2PanelX = 165, lfo2PanelY = row2Y;
+        {
+            int pw = 70;
+            Color lfo2Color = Color{180, 140, 100, 255};
+            DrawRectangle(lfo2PanelX, lfo2PanelY, pw, panelH, Color{35, 35, 45, 255});
+            DrawRectangleLines(lfo2PanelX, lfo2PanelY, pw, panelH, lfo2Color);
+            DrawText("LFO 2", lfo2PanelX + 20, lfo2PanelY + 4, 10, lfo2Color);
+
+            DrawKnob(lfo2PanelX + 35, lfo2PanelY + 38, 13, "Rate", &guiLfo2Rate, 0.1f, 20.0f, lfo2Color);
+            DrawKnob(lfo2PanelX + 35, lfo2PanelY + 90, 13, "Depth", &guiLfo2Depth, 0.0f, 1.0f, lfo2Color);
+            DrawLfoDropdown(lfo2PanelX + 8, lfo2PanelY + 120, 54, &guiLfo2Target, &lfo2DropdownOpen, "");
+        }
+
+        // FX Panel (alineado con OP4)
+        {
+            int px = 240, py = row2Y, pw = 70;
+            DrawRectangle(px, py, pw, panelH, Color{35, 35, 45, 255});
+            DrawRectangleLines(px, py, pw, panelH, Color{150, 100, 180, 255});
+            DrawText("FX", px + 28, py + 4, 10, Color{150, 100, 180, 255});
+
+            DrawVerticalSlider(px + 3, py + 20, 85, "Cho", &guiChorus, 0.0f, 1.0f, Color{100, 180, 220, 255});
+            DrawVerticalSlider(px + 36, py + 20, 85, "Rev", &guiReverb, 0.0f, 1.0f, Color{220, 150, 100, 255});
+        }
+
+        // MOD ENV Panel - con grafico de envolvente
+        int modEnvPanelX = 320, modEnvPanelY = row2Y;
+        {
+            Color modEnvColor = Color{180, 120, 180, 255};
+            DrawRectangle(modEnvPanelX, modEnvPanelY, 130, panelH, Color{35, 35, 45, 255});
+            DrawRectangleLines(modEnvPanelX, modEnvPanelY, 130, panelH, modEnvColor);
+            DrawText("MOD ENV", modEnvPanelX + 40, modEnvPanelY + 4, 10, modEnvColor);
+
+            DrawVerticalSlider(modEnvPanelX + 3, modEnvPanelY + 18, 50, "A", &guiModAttack, 0.001f, 2.0f, modEnvColor);
+            DrawVerticalSlider(modEnvPanelX + 28, modEnvPanelY + 18, 50, "D", &guiModDecay, 0.001f, 2.0f, modEnvColor);
+            DrawVerticalSlider(modEnvPanelX + 53, modEnvPanelY + 18, 50, "S", &guiModSustain, 0.0f, 1.0f, modEnvColor);
+            DrawVerticalSlider(modEnvPanelX + 78, modEnvPanelY + 18, 50, "R", &guiModRelease, 0.001f, 3.0f, modEnvColor);
+            DrawVerticalSlider(modEnvPanelX + 103, modEnvPanelY + 18, 50, "Amt", &guiModAmount, -1.0f, 1.0f, Color{220, 180, 100, 255});
+
+            // Grafico de envolvente
+            int graphX = modEnvPanelX + 5;
+            int graphY = modEnvPanelY + 95;
+            int graphW = 58;
+            int graphH = 22;
+            DrawRectangle(graphX, graphY, graphW, graphH, Color{25, 25, 35, 255});
+            DrawRectangleLines(graphX, graphY, graphW, graphH, Color{60, 60, 80, 255});
+
+            float totalTime = guiModAttack + guiModDecay + 0.2f + guiModRelease;
+            float scale = graphW / totalTime;
+            int attackEnd = graphX + (int)(guiModAttack * scale);
+            int decayEnd = attackEnd + (int)(guiModDecay * scale);
+            int sustainEnd = decayEnd + (int)(0.2f * scale);
+            int releaseEnd = sustainEnd + (int)(guiModRelease * scale);
+            if (releaseEnd > graphX + graphW) releaseEnd = graphX + graphW;
+            int baseY = graphY + graphH - 2;
+            int peakY = graphY + 2;
+            int sustainY = graphY + graphH - 2 - (int)(guiModSustain * (graphH - 4));
+
+            DrawLine(graphX, baseY, attackEnd, peakY, modEnvColor);
+            DrawLine(attackEnd, peakY, decayEnd, sustainY, modEnvColor);
+            DrawLine(decayEnd, sustainY, sustainEnd, sustainY, modEnvColor);
+            DrawLine(sustainEnd, sustainY, releaseEnd, baseY, modEnvColor);
+
+            // Target dropdown
+            DrawModEnvDropdown(modEnvPanelX + 68, modEnvPanelY + 95, 57, &guiModEnvTarget, &modEnvDropdownOpen, "", modEnvColor);
+        }
+
+        // ==================== ALGORITHM + RANDOMIZE (centrado entre modulos y waveform) ====================
+        int modulesEndX = 450;  // Donde terminan los modulos (MOD ENV)
+        int waveformEndX = screenWidth - 15;  // Donde termina el waveform
+        int algPanelW = 150;
+        int rightBlockX = modulesEndX + (waveformEndX - modulesEndX - algPanelW) / 2 + 5;
+
+        // ALGORITHM Panel (altura para alinearse con row2)
+        {
+            int px = rightBlockX, py = ROW1_Y, pw = 150, ph = 260;
+            DrawRectangle(px, py, pw, ph, Color{30, 30, 40, 255});
+            DrawRectangleLines(px, py, pw, ph, Color{80, 80, 100, 255});
+            DrawText("ALGORITHM", px + 14, py + 6, 10, Color{80, 80, 100, 255});
+
+            // 3 columnas x 2 filas
+            for (int i = 0; i < ALG_COUNT; i++) {
+                int col = i % 3, row = i / 3;
+                int btnX = px + 5 + col * 47, btnY = py + 22 + row * 22;
+                bool sel = (guiAlgorithm == i);
+                DrawRectangle(btnX, btnY, 44, 18, sel ? Color{80, 80, 180, 255} : Color{45, 45, 55, 255});
+                DrawRectangleLines(btnX, btnY, 44, 18, sel ? WHITE : DARKGRAY);
+                int tw = MeasureText(algorithmNames[i], 8);
+                DrawText(algorithmNames[i], btnX + (44 - tw) / 2, btnY + 5, 8, sel ? WHITE : GRAY);
+                Vector2 m = GetMousePosition();
+                if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON) && m.x >= btnX && m.x <= btnX + 44 && m.y >= btnY && m.y <= btnY + 18) {
+                    guiAlgorithm = i;
                 }
             }
-            Color btnColor = hover ? Color{80, 180, 80, 255} : Color{50, 120, 50, 255};
-            DrawRectangle(btnX, btnY, btnW, btnH, btnColor);
-            DrawRectangleLines(btnX, btnY, btnW, btnH, Color{100, 200, 100, 255});
-            int tw = MeasureText("RANDOMIZE", 11);
-            DrawText("RANDOMIZE", btnX + (btnW - tw) / 2, btnY + 9, 11, WHITE);
-        }
+            DrawAlgorithmDiagram(px + 35, py + 75, guiAlgorithm);
 
-        // ROW 2: WAVEFORM
-        DrawLine(20, 175, screenWidth - 20, 175, DARKGRAY);
-        DrawText("WAVEFORM", 20, 182, 10, GRAY);
-        DrawWaveform(20, 195, screenWidth - 40, 80);
+            // RANDOM Button dentro del panel
+            int btnX = px + 5, btnY = py + 130, btnW = 140, btnH = 24;
+            Vector2 mouse = GetMousePosition();
+            bool hover = mouse.x >= btnX && mouse.x <= btnX + btnW && mouse.y >= btnY && mouse.y <= btnY + btnH;
+            if (hover && IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
+                guiRatio1 = 0.5f + (rand() % 150) / 20.0f;
+                guiRatio2 = 0.5f + (rand() % 150) / 20.0f;
+                guiRatio3 = 0.5f + (rand() % 150) / 20.0f;
+                guiRatio4 = 0.5f + (rand() % 150) / 20.0f;
+                guiIndex1 = (rand() % 50) / 10.0f;
+                guiIndex2 = (rand() % 100) / 10.0f;
+                guiIndex3 = (rand() % 100) / 10.0f;
+                guiIndex4 = (rand() % 100) / 10.0f;
+                guiAttack = 0.001f + (rand() % 500) / 1000.0f;
+                guiDecay = 0.01f + (rand() % 500) / 500.0f;
+                guiSustain = 0.2f + (rand() % 80) / 100.0f;
+                guiRelease = 0.05f + (rand() % 200) / 100.0f;
+                guiAlgorithm = rand() % ALG_COUNT;
+            }
+            DrawRectangle(btnX, btnY, btnW, btnH, hover ? Color{70, 130, 70, 255} : Color{50, 90, 50, 255});
+            DrawRectangleLines(btnX, btnY, btnW, btnH, Color{80, 150, 80, 255});
+            DrawText("RANDOMIZE", btnX + 40, btnY + 6, 10, WHITE);
 
-        // ROW 3: KEYBOARD
-        DrawLine(20, 285, screenWidth - 20, 285, DARKGRAY);
-        DrawText("KEYBOARD", 20, 292, 10, GRAY);
+            // Preset info area
+            DrawText("Use Z/X for octave", px + 10, py + 165, 8, Color{70, 70, 90, 255});
+            DrawText("Keys: A-; for notes", px + 10, py + 180, 8, Color{70, 70, 90, 255});
+            DrawText("W,E,T,Y,U,O,P: sharps", px + 10, py + 195, 8, Color{70, 70, 90, 255});
 
-        // Octave indicator
-        {
-            DrawText("OCT", 80, 310, 9, Color{100, 100, 120, 255});
-            char octStr[8];
-            snprintf(octStr, sizeof(octStr), "%d", currentOctave);
-            DrawRectangle(105, 306, 22, 18, Color{40, 40, 50, 255});
-            DrawRectangleLines(105, 306, 22, 18, Color{80, 80, 100, 255});
-            int octW = MeasureText(octStr, 12);
-            DrawText(octStr, 116 - octW / 2, 309, 12, WHITE);
-            DrawText("Z/X", 90, 328, 8, Color{60, 60, 80, 255});
-        }
-
-        // Voices indicator
-        {
-            int voiceX = screenWidth - 130;
-            DrawText("VOICES", voiceX, 310, 9, Color{100, 100, 120, 255});
+            // Voices status in algorithm panel
+            DrawText("VOICES", px + 10, py + 215, 9, Color{100, 180, 100, 255});
             for (int v = 0; v < NUM_VOICES; v++) {
-                int cx = voiceX + 5 + v * 14;
-                int cy = 330;
+                int row = v / 8, col = v % 8;
+                int cx = px + 15 + col * 16;
+                int cy = py + 232 + row * 14;
                 bool active = voices[v].synth->isActive();
-                Color dotColor = active ? Color{100, 200, 100, 255} : Color{50, 50, 60, 255};
-                DrawCircle(cx, cy, 4, dotColor);
-                DrawCircleLines(cx, cy, 4, Color{80, 80, 100, 255});
+                DrawCircle(cx, cy, 4, active ? Color{100, 200, 100, 255} : Color{40, 40, 50, 255});
             }
         }
 
-        // Piano
-        int pianoX = (screenWidth - 15 * 28) / 2;
-        DrawPiano(pianoX, 305, &pianoNote);
-
-        if (pianoNote >= 0) {
-            currentKeys.push_back(pianoNote);
+        // ==================== WAVEFORM ====================
+        int waveformY = row2Y + panelH + 5;  // Despues de row2 panels
+        {
+            static float waveData[WAVEFORM_SIZE];
+            for (int i = 0; i < WAVEFORM_SIZE; i++) {
+                waveData[i] = waveformBuffer->read(i);
+            }
+            DrawWaveform(15, waveformY, screenWidth - 30, 30, waveData, WAVEFORM_SIZE, 0);
         }
 
-        // Note offs
+        // ==================== ZONA INFERIOR: PRESETS + KEYBOARD + OCTAVE ====================
+        int bottomY = waveformY + 37;
+
+        // PRESETS Panel (izquierda del teclado)
+        int bottomH = screenHeight - bottomY - 5;
+        {
+            int px = 15, py = bottomY, pw = 70, ph = bottomH;
+            DrawRectangle(px, py, pw, ph, Color{35, 35, 45, 255});
+            DrawRectangleLines(px, py, pw, ph, Color{100, 180, 100, 255});
+            DrawText("PRESETS", px + 10, py + 4, 9, Color{100, 180, 100, 255});
+
+            for (int i = 0; i < NUM_PRESETS; i++) {
+                int btnX = px + 3, btnY = py + 16 + i * 11;
+                bool sel = (i == currentPreset);
+                DrawRectangle(btnX, btnY, 64, 10, sel ? Color{70, 120, 70, 255} : Color{40, 40, 50, 255});
+                DrawRectangleLines(btnX, btnY, 64, 10, sel ? Color{100, 180, 100, 255} : Color{50, 50, 60, 255});
+                int tw = MeasureText(presets[i].name, 8);
+                DrawText(presets[i].name, btnX + (64 - tw) / 2, btnY + 1, 8, sel ? WHITE : GRAY);
+                Vector2 m = GetMousePosition();
+                if (IsMouseButtonPressed(MOUSE_LEFT_BUTTON) && m.x >= btnX && m.x <= btnX + 64 && m.y >= btnY && m.y <= btnY + 10) {
+                    currentPreset = i;
+                    loadFromPreset(i);
+                }
+            }
+
+            // SAVE/LOAD buttons
+            int saveBtnY = py + ph - 14;
+            {
+                Vector2 m = GetMousePosition();
+                bool h = m.x >= px + 3 && m.x <= px + 34 && m.y >= saveBtnY && m.y <= saveBtnY + 12;
+                DrawRectangle(px + 3, saveBtnY, 31, 12, h ? Color{90, 70, 40, 255} : Color{60, 50, 35, 255});
+                DrawRectangleLines(px + 3, saveBtnY, 31, 12, Color{150, 120, 60, 255});
+                DrawText("SAVE", px + 6, saveBtnY + 2, 8, WHITE);
+                if (h && IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) saveToPreset(currentPreset);
+            }
+            {
+                Vector2 m = GetMousePosition();
+                bool h = m.x >= px + 36 && m.x <= px + 67 && m.y >= saveBtnY && m.y <= saveBtnY + 12;
+                DrawRectangle(px + 36, saveBtnY, 31, 12, h ? Color{50, 80, 50, 255} : Color{40, 60, 40, 255});
+                DrawRectangleLines(px + 36, saveBtnY, 31, 12, Color{80, 140, 80, 255});
+                DrawText("LOAD", px + 39, saveBtnY + 2, 8, WHITE);
+                if (h && IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) loadFromPreset(currentPreset);
+            }
+        }
+
+        // KEYBOARD - 10 teclas blancas que ocupan todo el ancho disponible
+        {
+            int keyboardX = 90;
+            int keyboardY = bottomY;
+            int keyboardEndX = screenWidth - 10;  // Hasta el borde derecho
+            int numWhiteKeys = 10;
+            int whiteW = (keyboardEndX - keyboardX) / numWhiteKeys;
+            int whiteH = bottomH;
+            int blackW = whiteW * 2 / 3;
+            int blackH = whiteH * 3 / 5;
+            int baseMidi = 12 * currentOctave;
+
+            // Dibujar teclas blancas
+            for (int i = 0; i < numWhiteKeys; i++) {
+                int x = keyboardX + i * whiteW;
+                int midiNote = baseMidi + whiteKeyNotes[i];
+                bool pressed = isNoteActive(midiNote);
+
+                Vector2 m = GetMousePosition();
+                if (IsMouseButtonDown(MOUSE_LEFT_BUTTON) && m.x >= x && m.x < x + whiteW && m.y >= keyboardY && m.y < keyboardY + whiteH) {
+                    bool onBlack = false;
+                    int blackPos[] = {0, 1, 3, 4, 5, 7, 8};
+                    for (int j = 0; j < 7; j++) {
+                        int bx = keyboardX + blackPos[j] * whiteW + whiteW - blackW / 2;
+                        if (m.x >= bx && m.x < bx + blackW && m.y < keyboardY + blackH) {
+                            onBlack = true;
+                            break;
+                        }
+                    }
+                    if (!onBlack) {
+                        pianoNote = midiNote;
+                        pressed = true;
+                    }
+                }
+
+                Color c = pressed ? Color{100, 100, 255, 255} : RAYWHITE;
+                DrawRectangle(x, keyboardY, whiteW - 2, whiteH, c);
+                DrawRectangleLines(x, keyboardY, whiteW - 2, whiteH, DARKGRAY);
+
+                const char* keyLabels[] = {"A", "S", "D", "F", "G", "H", "J", "K", "L", ";"};
+                int tw = MeasureText(keyLabels[i], 14);
+                DrawText(keyLabels[i], x + (whiteW - tw) / 2 - 1, keyboardY + whiteH - 20, 14, Color{100, 100, 100, 255});
+            }
+
+            // Dibujar teclas negras (7 teclas negras para las 10 blancas)
+            int blackPositions[] = {0, 1, 3, 4, 5, 7, 8};
+            const char* blackLabels[] = {"W", "E", "T", "Y", "U", "O", "P"};
+            for (int i = 0; i < 7; i++) {
+                int x = keyboardX + blackPositions[i] * whiteW + whiteW - blackW / 2;
+                int midiNote = baseMidi + blackKeyNotes[i];
+                bool pressed = isNoteActive(midiNote);
+
+                Vector2 m = GetMousePosition();
+                if (IsMouseButtonDown(MOUSE_LEFT_BUTTON) && m.x >= x && m.x < x + blackW && m.y >= keyboardY && m.y < keyboardY + blackH) {
+                    pianoNote = midiNote;
+                    pressed = true;
+                }
+
+                Color c = pressed ? Color{80, 80, 200, 255} : Color{25, 25, 25, 255};
+                DrawRectangle(x, keyboardY, blackW, blackH, c);
+                DrawRectangleLines(x, keyboardY, blackW, blackH, Color{50, 50, 50, 255});
+                int tw = MeasureText(blackLabels[i], 10);
+                DrawText(blackLabels[i], x + (blackW - tw) / 2, keyboardY + blackH - 14, 10, Color{80, 80, 80, 255});
+            }
+
+            // Octave indicator on keyboard
+            char octLabel[12];
+            snprintf(octLabel, 12, "Oct %d", currentOctave);
+            DrawRectangle(keyboardX + 2, keyboardY + 2, 45, 16, Color{40, 40, 60, 200});
+            DrawText(octLabel, keyboardX + 6, keyboardY + 4, 12, Color{150, 180, 220, 255});
+        }
+
+        // Note handling
+        if (pianoNote >= 0) currentKeys.push_back(pianoNote);
+
         for (int note : activeNotes) {
-            bool stillActive = false;
-            for (int k : currentKeys) {
-                if (k == note) { stillActive = true; break; }
-            }
-            if (!stillActive) {
-                voiceNoteOff(note);
-            }
+            bool still = false;
+            for (int k : currentKeys) if (k == note) { still = true; break; }
+            if (!still) voiceNoteOff(note);
         }
 
-        // Note ons
         for (int note : currentKeys) {
-            bool wasActive = false;
-            for (int a : activeNotes) {
-                if (a == note) { wasActive = true; break; }
-            }
-            if (!wasActive) {
-                double freq = midiToFreq(note);
-                voiceNoteOn(note, freq);
-            }
+            bool was = false;
+            for (int a : activeNotes) if (a == note) { was = true; break; }
+            if (!was) voiceNoteOn(note, midiToFreq(note));
         }
 
         activeNotes = currentKeys;
 
-        // FOOTER (compacto)
-        DrawText("Play with keyboard or mouse  |  Z/X: octave  |  ESC: exit", 20, 410, 9, Color{60, 60, 80, 255});
+        // Dropdown lists (al final para estar encima de todo)
+        DrawLfoDropdownList(lfo1PanelX + 8, lfo1PanelY + 120, 54, &guiLfo1Target, &lfo1DropdownOpen);
+        DrawLfoDropdownList(lfo2PanelX + 8, lfo2PanelY + 120, 54, &guiLfo2Target, &lfo2DropdownOpen);
+        DrawModEnvDropdownList(modEnvPanelX + 68, modEnvPanelY + 95, 57, &guiModEnvTarget, &modEnvDropdownOpen, Color{180, 120, 180, 255});
 
         EndDrawing();
     }
